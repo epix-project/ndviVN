@@ -7,7 +7,6 @@ editor_options:
 
 ```{r}
 library(magrittr)
-#library(sp)
 library(raster)
 ```
 
@@ -16,7 +15,7 @@ library(raster)
 There are 228 NDVI raster files and each of them is about 55 MB in size, making
 a total of about 12.5 GB which is becomes difficult to handle. To reduce the
 size of these files, let's crop them around the bounding box of Vietnam. For
-that, let's download the polygon of Vietnam to disk from (GADM)[https://gadm.org]:
+that, let's download the polygon of Vietnam to disk from [GADM](https://gadm.org):
 
 ```{r eval = FALSE}
 download.file("https://biogeo.ucdavis.edu/data/gadm3.6/Rsp/gadm36_VNM_0_sp.rds", "country.rds")
