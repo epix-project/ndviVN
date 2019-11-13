@@ -1,0 +1,290 @@
+---
+title: "NDVI"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(magrittr)
+#library(sp)
+library(raster)
+```
+
+## Crop the NDVI raster files
+
+There are 228 NDVI raster files and each of them is about 55 MB in size, making
+a total of about 12.5 GB which is becomes difficult to handle. To reduce the
+size of these files, let's crop them around the bounding box of Vietnam. For
+that, let's download the polygon of Vietnam to disk from (GADM)[https://gadm.org]:
+
+```{r eval = FALSE}
+download.file("https://biogeo.ucdavis.edu/data/gadm3.6/Rsp/gadm36_VNM_0_sp.rds", "country.rds")
+```
+
+And load it to R:
+
+```{r}
+country <- readRDS("country.rds")
+```
+
+Before considering using a polygon in order to crop a raster file, we first need
+to ensure that the two spatial objects have the same projection:
+
+```{r}
+projection(country)
+```
+
+The NDVI raster files are in the `ndvi` directory. Let's check their projections:
+
+```{r}
+unique(sapply(paste0("ndvi/", dir("ndvi")), function(x) projection(raster(x))))
+```
+
+We'll put the cropped files in the following folder:
+
+```{r}
+path <- "ndvi_cropped"
+```
+
+Let's create it:
+
+```{r eval = FALSE}
+dir.create(path)
+```
+
+Here is the function that performs the cropping and write the outputed raster to
+disk:
+
+```{r}
+cropping <- function(x) {
+  require(magrittr)
+  require(raster)
+  x %>% 
+    paste0("ndvi/", .) %>% 
+    raster(varname = "NDVI") %>% 
+    crop(country, paste0(path, sub(".nc", "_VN.tif", x)))
+}
+```
+
+where `x` is the name of a raster file. Let's crop all the files:
+
+```{r eval = FALSE}
+ndvi <- lapply(dir("ndvi"), cropping)
+```
+
+```{r include = FALSE}
+ndvi <- lapply(paste0("ndvi_cropped/", dir("ndvi_cropped")), raster)
+```
+
+Adding names to `ndvi`:
+
+```{r}
+names(ndvi) <- dir("ndvi_cropped") %>% 
+  stringr::str_remove("^.*NOAA-1\\d_") %>% 
+  stringr::str_remove("_.*$")
+```
+
+We can see the benefit of the croppping, going from 12.5 GB down to 25 MB only:
+
+```{r}
+system("du -sh ndvi_cropped")
+```
+
+Let's check the dates:
+
+```{r}
+names(ndvi) %>% 
+  lubridate::ymd() %>% 
+  tibble::enframe(name = NULL, value = "date") %>% 
+  dplyr::mutate(year = lubridate::year(date), month = lubridate::month(date)) %$% 
+  table(year, month)
+```
+
+Let's order them chronologically:
+
+```{r}
+ndvi <- ndvi[rank(lubridate::ymd(names(ndvi)))]
+```
+
+## Computing population weights
+
+### Loading population data
+
+Looks good! Next, we need the population data from [WorldPop](http://www.worldpop.org.uk):
+
+```{r eval = FALSE}
+dir.create("worldpop")
+for (year in 2000:2011)
+  download.file(paste0("ftp://ftp.worldpop.org.uk/GIS/Population/Global_2000_2020/", year, "/VNM/vnm_ppp_", year, ".tif"),
+                paste0("worldpop/vnm_ppp_", year, ".tif"))
+```
+
+Next, we need to resample the population raster files onto the NDVI file. Same
+as for the cropping, we first need to ensure that the 2 types of raster have the
+same projecion:
+
+```{r}
+unique(sapply(ndvi, projection))
+```
+
+and:
+
+```{r}
+unique(sapply(paste0("worldpop/", dir("worldpop")), function(x) projection(raster(x))))
+```
+
+Everything is good. Let's now verify that all the NDVI files have the same grid:
+
+```{r}
+length(unique(lapply(dir("ndvi_cropped"), function(x) bbox(raster(paste0("ndvi_cropped/", x))))))
+```
+
+for the extents and
+
+```{r}
+length(unique(lapply(dir("ndvi_cropped"), function(x) res(raster(paste0("ndvi_cropped/", x))))))
+```
+
+for the resolutions. This means that we can resample all the population rasters
+on the same NDVI raster file (takes about 10'):
+
+```{r eval = FALSE}
+dir.create("worldpop_resampled")
+files <- dir("worldpop")
+wp <- files %>%
+  parallel::mclapply(function(x) resample(raster(paste0("worldpop/", x)), ndvi[[1]], filename = paste0("worldpop_resampled/", x)), mc.cores = 4) %>% 
+  setNames(files)
+```
+
+```{r include = FALSE}
+wp <- lapply(paste0("worldpop_resampled/", dir("worldpop_resampled")), raster)
+```
+
+Let's add the names:
+
+```{r}
+names(wp) <- dir("worldpop") %>% 
+  stringr::str_remove("^.*p_") %>% 
+  stringr::str_remove("\\..*$")
+```
+
+Let's order `wp` chronologically:
+
+```{r}
+wp <- wp[rank(as.integer(names(wp)))]
+```
+
+### Splitting by province and calculating the weights
+
+Next, we need to split the raster file using the polygons of the province. Let's
+download the polygons of the provinces from [GADM](https://gadm.org):
+
+```{r eval = FALSE}
+download.file("https://biogeo.ucdavis.edu/data/gadm3.6/Rsp/gadm36_VNM_1_sp.rds", "provinces.rds")
+```
+
+Loading them into R:
+
+```{r}
+provinces <- readRDS("provinces.rds")
+```
+
+Again, let's check it's the same projection:
+
+```{r}
+projection(provinces)
+```
+
+and:
+
+```{r}
+unique(sapply(ndvi, projection))
+```
+
+and:
+
+```{r}
+unique(sapply(wp, projection))
+```
+
+OK. Now, let's compute provinces' masks:
+
+```{r}
+wpop <- wp[[1]]
+prov_masks <- lapply(seq_along(provinces), function(x) rasterize(provinces[x, ], crop(wpop, provinces[x, ])))
+```
+
+The following function calculates the weights, using the masks:
+
+```{r}
+calc_weights <- function(prov_mask, wpop) {
+  wpop_val <- values(mask(crop(wpop, prov_mask), prov_mask))
+  wpop_val / sum(wpop_val, na.rm = TRUE)
+}
+```
+
+where `prov_mask` is a province mask and `wpop` is a WorldPop raster. Now, we
+can calculate the weights (takes about 1'30''):
+
+```{r}
+weights <- parallel::mclapply(wp, function(x) lapply(prov_masks, calc_weights, x), mc.cores = 4)
+```
+
+## Aggregating
+
+Let's now use these weights together with the `ndvi` rasters to compute NDVI
+values by province. As above, we first need to split NDVI rasters by province,
+which is what the following function does:
+
+```{r}
+separate_by_province <- function(prov_mask, ndvi) {
+  values(mask(crop(ndvi, prov_mask), prov_mask))
+}
+```
+
+Let's use this function to separate the NDVI files by province (takes about
+17'-18'):
+
+```{r eval = FALSE}
+ndvi2 <- parallel::mclapply(ndvi, function(x) lapply(prov_masks, separate_by_province, x), mc.cores = 4)
+```
+
+```{r include = FALSE}
+ndvi2 <- readRDS("ndvi2.rds")
+```
+
+After making sure that the NDVI vector is of the same length as the weights
+vector:
+
+```{r}
+weights2 <- rep(c(weights[c(1, 1)], weights), each = 12)
+```
+
+Let's compute:
+
+```{r}
+ndvi3 <- purrr::map2(ndvi2, weights2, purrr::map2, function(x, y) sum(x * y, na.rm = TRUE)) %>% 
+  lapply(setNames, provinces$VARNAME_1) %>% 
+  dplyr::bind_rows(.id = "date") %>% 
+  tidyr::separate(date, c("year", "month", "day"), c(4, 6)) %>% 
+  dplyr::select(-day) %>% 
+  dplyr::mutate_at(c("year", "month"), as.integer) %>% 
+  dplyr::arrange(year, month) %>% 
+  dplyr::mutate(month = as.ordered(month.name[month])) %>% 
+  tidyr::pivot_longer(-tidyselect::any_of(c("year", "month")), names_to = "province", values_to = "ndvi")
+```
+
+Let's have a look:
+
+```{r}
+ndvi3 %>% 
+  dplyr::filter(province == "Ha Noi") %$%
+  plot(ndvi, type = "l")
+```
+
+
+
+
+
+
